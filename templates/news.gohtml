@@ -1,0 +1,14 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Quiet Hacker News</title>
+</head>
+<body>
+<ol>
+    {{range .}}
+        <li><a href="{{.Url}}">{{- /*gotype: awesomeProject/hn.Item*/ -}}{{.Title}}({{.Domain}})</a></li>
+    {{end}}
+</ol>
+</body>
+</html>
