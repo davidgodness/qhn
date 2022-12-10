@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"sort"
 	"sync"
 )
 
@@ -20,6 +21,8 @@ type Item struct {
 	Url         string   `json:"url"`
 }
 
+const baseUrl = "https://hacker-news.firebaseio.com/v0"
+
 type FilterFuc func(item Item) bool
 
 var mu = &sync.Mutex{}
@@ -28,11 +31,10 @@ var cache = make(map[uint64]Item)
 func TopStories() ([]uint64, error) {
 	var ret []uint64
 
-	rsp, err := http.Get("https://hacker-news.firebaseio.com/v0/topstories.json?print=pretty")
+	rsp, err := http.Get(baseUrl + "/topstories.json?print=pretty")
 	if err != nil {
 		return nil, err
 	}
-	log.Println("GET", "https://hacker-news.firebaseio.com/v0/topstories.json?print=pretty")
 
 	defer rsp.Body.Close()
 
@@ -44,27 +46,89 @@ func TopStories() ([]uint64, error) {
 	return ret, err
 }
 
-func QueryItem(itemId uint64, item chan<- Item) {
-	if cachedItem, ok := cache[itemId]; ok {
-		item <- cachedItem
-		return
-	}
-	urlStr := fmt.Sprintf("https://hacker-news.firebaseio.com/v0/item/%d.json?print=pretty", itemId)
+func QueryItem(itemId uint64) (Item, error) {
+	ret := Item{}
+	urlStr := fmt.Sprintf(baseUrl+"/item/%d.json?print=pretty", itemId)
 	rsp, err := http.Get(urlStr)
-	defer close(item)
 	if err != nil {
-		return
+		return ret, err
 	}
 	log.Println("GET", urlStr)
-	ret := Item{}
+
 	err = json.NewDecoder(rsp.Body).Decode(&ret)
 	if err != nil {
-		return
+		return ret, err
 	}
-	item <- ret
-	mu.Lock()
-	cache[itemId] = ret
-	mu.Unlock()
+	return ret, nil
+}
+
+type job struct {
+	id     int
+	itemId uint64
+}
+
+type result struct {
+	id int
+	Item
+	err error
+}
+
+func worker(jobs chan job, results chan result) {
+	for job := range jobs {
+		initResult := result{id: job.id}
+		if cachedItem, ok := cache[job.itemId]; ok {
+			initResult.Item = cachedItem
+			results <- initResult
+			continue
+		}
+
+		ret, err := QueryItem(job.itemId)
+		if err != nil {
+			initResult.err = err
+		} else {
+			initResult.Item = ret
+		}
+		mu.Lock()
+		cache[job.itemId] = ret
+		mu.Unlock()
+		results <- initResult
+	}
+}
+
+func QueryItems(itemIds []uint64) ([]Item, error) {
+
+	jobs := make(chan job, len(itemIds))
+	results := make(chan result, len(itemIds))
+
+	// limit the gorouting number
+	for i := 0; i < 4; i++ {
+		go worker(jobs, results)
+	}
+
+	for i, id := range itemIds {
+		jobs <- job{
+			id:     i,
+			itemId: id,
+		}
+	}
+	close(jobs)
+
+	items := make([]Item, 0, len(itemIds))
+	resList := make([]result, 0, len(itemIds))
+
+	for i := 0; i < len(itemIds); i++ {
+		resList = append(resList, <-results)
+	}
+
+	sort.Slice(resList, func(i, j int) bool {
+		return resList[i].id < resList[j].id
+	})
+
+	for _, res := range resList {
+		items = append(items, res.Item)
+	}
+
+	return items, nil
 }
 
 func ListStoryDetails(num int, isFilterOut FilterFuc) ([]Item, error) {
@@ -82,19 +146,21 @@ func ListStoryDetails(num int, isFilterOut FilterFuc) ([]Item, error) {
 	offset := 0
 	for len(items) < num {
 		queryNum := num - len(items) + 2
-		chs := make([]chan Item, 0, queryNum)
-		for i := 0; i < queryNum; i++ {
-			chs = append(chs, make(chan Item, 1))
+
+		ret, err := QueryItems(topItemIds[offset : offset+queryNum])
+		if err != nil {
+			return nil, err
 		}
-		for i, ch := range chs {
-			go QueryItem(topItemIds[i+offset], ch)
-		}
-		for _, ch := range chs {
-			item := <-ch
-			if !isFilterOut(item) && len(items) < num {
+
+		for _, item := range ret {
+			if len(items) >= num {
+				break
+			}
+			if !isFilterOut(item) {
 				items = append(items, item)
 			}
 		}
+
 		offset += queryNum
 	}
 
